@@ -178,23 +178,30 @@ router.post('/career/copilot/message', authMiddleware, checkRole(['student']), a
       `GitHub Languages: ${(context.github?.topLanguages || []).join(', ') || 'No public language data yet'}`,
       `Assessment Average: ${Math.round(context.assessmentAverage || 0)}`,
       `Question: ${message}`,
-      'Return a highly specific response that directly references the numeric signals above.',
-      'Do not write generic filler. Give exactly these sections:',
-      '1) What the profile is currently doing well.',
-      '2) The 3 highest-impact next actions.',
-      '3) Certifications to consider.',
-      '4) Projects to build next.',
-      '5) A 30-day learning roadmap.',
-      'Make recommendations based on the student data, not broad career advice.'
+      'Return ONLY a valid JSON object matching exactly this schema. Do NOT include markdown code blocks (```json) around the output. Just raw JSON:',
+      '{',
+      '  "analysis": "A clean 2-sentence summary of their profile.",',
+      '  "strengths": ["string"],',
+      '  "weaknesses": ["string"],',
+      '  "risks": ["string"],',
+      '  "recommendations": ["string"],',
+      '  "plan": ["Week 1: task", "Week 2: task", "Week 3: task", "Week 4: task"],',
+      '  "readinessScore": number',
+      '}'
     ].join('\n');
 
-    const answer = await callGemini(prompt);
+    const rawAnswer = await callGemini(prompt);
+    let parsedAnswer = { analysis: rawAnswer, strengths: [], weaknesses: [], risks: [], recommendations: [], plan: [], readinessScore: 0 };
+    try {
+      const jsonMatch = rawAnswer.match(/\{[\s\S]*\}/);
+      if (jsonMatch) parsedAnswer = JSON.parse(jsonMatch[0]);
+    } catch(e) {}
 
     const saved = await db.careerCopilotConversations.create({
       userId: req.user.id,
       userName: context.user?.name || 'Student',
       question: message,
-      answer,
+      answer: parsedAnswer,
       profileSnapshot: {
         atsScore: context.profile?.atsScore || 0,
         resumeQuality: context.profile?.industryReadinessScore || 0,
@@ -203,7 +210,7 @@ router.post('/career/copilot/message', authMiddleware, checkRole(['student']), a
       }
     });
 
-    res.json({ answer, history: saved });
+    res.json({ answer: parsedAnswer, history: saved });
   } catch (error) {
     logStability(`Copilot failed: ${error.message}`);
     res.status(500).json({ message: error.message || 'AI Career Copilot failed.' });
@@ -213,269 +220,46 @@ router.post('/career/copilot/message', authMiddleware, checkRole(['student']), a
 router.get('/career/readiness', authMiddleware, checkRole(['student']), async (req, res) => {
   const context = await buildProfileContext(req.user.id);
   const readiness = context.readiness;
-  const strengths = [
-    readiness >= 70 ? 'Strong resume alignment and project evidence' : 'Resume alignment needs more role-specific keywords',
-    context.github?.strengthScore >= 60 ? 'GitHub activity is contributing positively to your profile' : 'GitHub activity can be strengthened with more public repos',
-    context.assessmentAverage >= 70 ? 'Assessment scores show solid technical confidence' : 'Skill assessments indicate a good area to improve'
-  ].filter(Boolean);
-  const weakAreas = [
-    context.profile?.atsScore < 70 ? 'ATS score needs improvement.' : null,
-    (context.profile?.certifications || []).length < 2 ? 'Add more certifications to improve credibility.' : null,
-    context.github?.strengthScore < 50 ? 'GitHub activity needs more visible repositories or stars.' : null
-  ].filter(Boolean);
-  const recommendations = [
-    'Tailor the summary and skills section using the job description.',
-    'Publish one project with a clear impact statement and README.',
-    'Complete another skill assessment and revisit your weak areas.'
-  ];
-
-  await db.placementReadinessSnapshots.create({
-    userId: req.user.id,
-    score: readiness,
-    metrics: {
-      atsScore: context.profile?.atsScore || 0,
-      resumeQuality: context.profile?.industryReadinessScore || 0,
-      githubScore: context.github?.strengthScore || 0,
-      assessmentScore: Math.round(context.assessmentAverage || 0),
-      certifications: (context.profile?.certifications || []).length,
-      projects: (context.profile?.projects || []).length,
-      applicationSuccessRate: context.acceptanceRate || 0
-    },
-    strengths,
-    weakAreas,
-    recommendations,
-    createdAt: new Date().toISOString()
-  }).catch(() => null);
-
-  res.json({
-    score: readiness,
-    label: readiness >= 80 ? 'Career Ready' : readiness >= 60 ? 'On Track' : 'Needs Focus',
-    strengths,
-    weakAreas,
-    suggestions: recommendations,
-    recommendations,
-    metrics: {
-      atsScore: context.profile?.atsScore || 0,
-      resumeQuality: context.profile?.industryReadinessScore || 0,
-      githubScore: context.github?.strengthScore || 0,
-      assessmentScore: Math.round(context.assessmentAverage || 0),
-      certifications: (context.profile?.certifications || []).length,
-      projects: (context.profile?.projects || []).length,
-      applicationSuccessRate: context.acceptanceRate || 0
-    },
-    appliedJobs: context.applications.length,
-    profile: context.profile || null,
-    github: context.github || null,
-    assessmentAverage: Math.round(context.assessmentAverage || 0),
-    acceptanceRate: context.acceptanceRate || 0
-  });
-});
-
-router.post('/github/analyze', authMiddleware, checkRole(['student']), async (req, res) => {
-  try {
-    const input = (req.body.username || req.body.profileUrl || '').trim();
-    const username = parseGitHubUsername(input);
-    if (!username) {
-      return res.status(400).json({ message: 'Please provide a GitHub username or profile URL.' });
-    }
-
-    const profile = await fetchJson(`https://api.github.com/users/${username}`);
-    const repos = await fetchJson(`https://api.github.com/users/${username}/repos?per_page=100&type=owner&sort=updated`);
-    const events = await fetchJson(`https://api.github.com/users/${username}/events/public?per_page=30`).catch(() => []);
-
-    const languageTotals = {};
-    for (const repo of repos) {
-      if (repo.language) {
-        languageTotals[repo.language] = (languageTotals[repo.language] || 0) + 1;
-      }
-    }
-
-    const topRepos = repos
-      .sort((a, b) => (b.stargazers_count || 0) - (a.stargazers_count || 0) || (b.forks_count || 0) - (a.forks_count || 0))
-      .slice(0, 6);
-
-    const totalStars = repos.reduce((sum, repo) => sum + (repo.stargazers_count || 0), 0);
-    const totalForks = repos.reduce((sum, repo) => sum + (repo.forks_count || 0), 0);
-    const contributionScore = clamp(Math.round((profile.followers || 0) * 3 + totalStars * 1.5 + totalForks * 2 + repos.length * 4 + events.length * 2), 0, 100);
-
-    const topLanguages = Object.entries(languageTotals)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 8)
-      .map(([name]) => name);
-
-    const payload = {
-      userId: req.user.id,
-      username,
-      profileUrl: profile.html_url || `https://github.com/${username}`,
-      profile,
-      repos: topRepos,
-      topLanguages,
-      languages: Object.entries(languageTotals).sort((a, b) => b[1] - a[1]).slice(0, 8),
-      starsEarned: totalStars,
-      totalStars,
-      forksCount: totalForks,
-      contributionScore,
-      strengthScore: contributionScore,
-      repositoryCount: repos.length,
-      followerCount: profile.followers || 0,
-      followingCount: profile.following || 0,
-      followers: profile.followers || 0,
-      activityScore: events.length,
-      highlights: [
-        `${repos.length} public repositories`,
-        `${totalStars} stars collected across top projects`,
-        `${events.length} recent public activities`
-      ],
-      contributionSummary: `${repos.length} repositories • ${totalStars} stars • ${totalForks} forks • ${events.length} recent public activities`,
-      analyzedAt: new Date().toISOString()
+  const getScoreDetails = (score, max, whyLow, whyHigh, howLow, howHigh, impactLow, impactHigh) => {
+    const isGood = score >= max * 0.7;
+    return {
+      score: Math.round(score),
+      why: isGood ? whyHigh : whyLow,
+      how: isGood ? howHigh : howLow,
+      impact: isGood ? impactHigh : impactLow
     };
-
-    const existing = await db.githubProfiles.findOne({ userId: req.user.id });
-    if (existing) {
-      await db.githubProfiles.findByIdAndUpdate(existing.id, payload);
-    } else {
-      await db.githubProfiles.create(payload);
-    }
-
-    res.json(payload);
-  } catch (error) {
-    logStability(`GitHub analyze failed: ${error.message}`);
-    res.status(422).json({ message: error.message || 'GitHub profile could not be fetched.' });
-  }
-});
-
-router.get('/github/profile', authMiddleware, checkRole(['student']), async (req, res) => {
-  const record = await db.githubProfiles.findOne({ userId: req.user.id });
-  res.json(record || null);
-});
-
-router.post('/resume/tailor', authMiddleware, checkRole(['student']), async (req, res) => {
-  const { targetRole, jobDescription } = req.body;
-  const profile = await db.studentProfiles.findOne({ userId: req.user.id });
-  const resumeText = profile?.resumeText || '';
-
-  if (!resumeText || !targetRole || !jobDescription) {
-    return res.status(400).json({ message: 'Resume text, target role, and job description are required.' });
-  }
-
-  try {
-    const prompt = [
-      'You are CareerGenie AI Resume Tailor. Rewrite the resume text for the target role using the job description and keep it realistic.',
-      'Return strict JSON with keys: matchPercentage, matchingSkills, missingSkills, keywordAnalysis, atsSuggestions, summary, skillsSection, projects, experienceDescriptions, tailoredResume.',
-      'Resume text:\n' + resumeText,
-      'Target Role:\n' + targetRole,
-      'Job Description:\n' + jobDescription
-    ].join('\n');
-
-    const raw = await callGemini(prompt);
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : null;
-
-    const matchPercentage = Number(parsed?.matchPercentage || 0);
-    const missingSkills = Array.isArray(parsed?.missingSkills) ? parsed.missingSkills : [];
-    const matchingSkills = Array.isArray(parsed?.matchingSkills) ? parsed.matchingSkills : [];
-    const keywordAnalysis = parsed?.keywordAnalysis || 'Extracted keywords from the job post and resume context.';
-    const atsSuggestions = Array.isArray(parsed?.atsSuggestions) ? parsed.atsSuggestions : [];
-
-    const version = await db.resumeTailorVersions.create({
-      userId: req.user.id,
-      targetRole,
-      jobDescription,
-      beforeVersion: {
-        resumeText,
-        skills: profile?.skills || [],
-        certifications: profile?.certifications || []
-      },
-      afterVersion: {
-        summary: parsed?.summary || '',
-        skillsSection: parsed?.skillsSection || '',
-        projects: parsed?.projects || '',
-        experienceDescriptions: parsed?.experienceDescriptions || [],
-        tailoredResume: parsed?.tailoredResume || raw,
-        matchPercentage,
-        matchingSkills,
-        missingSkills,
-        keywordAnalysis,
-        atsSuggestions
-      },
-      generatedAt: new Date().toISOString()
-    });
-
-    res.json({
-      message: 'Resume tailored successfully.',
-      matchPercentage,
-      matchingSkills,
-      missingSkills,
-      keywordAnalysis,
-      atsSuggestions,
-      optimizedSummary: parsed?.summary || '',
-      optimizedSkills: parsed?.skillsSection || '',
-      optimizedProjects: parsed?.projects || '',
-      optimizedExperience: parsed?.experienceDescriptions || [],
-      version,
-      beforeVersion: version.beforeVersion,
-      afterVersion: version.afterVersion
-    });
-  } catch (error) {
-    logStability(`Resume tailor failed: ${error.message}`);
-    res.status(500).json({ message: error.message || 'AI Resume Tailor failed.' });
-  }
-});
-
-router.get('/resume/versions', authMiddleware, checkRole(['student']), async (req, res) => {
-  const versions = await db.resumeTailorVersions.find({ userId: req.user.id });
-  res.json((versions || []).sort((a, b) => new Date(b.generatedAt) - new Date(a.generatedAt)));
-});
-
-router.post('/resume/rollback/:id', authMiddleware, checkRole(['student']), async (req, res) => {
-  const version = await db.resumeTailorVersions.findById(req.params.id);
-  if (!version || version.userId !== req.user.id) {
-    return res.status(404).json({ message: 'Resume version not found.' });
-  }
-
-  const profile = await db.studentProfiles.findOne({ userId: req.user.id });
-  if (!profile) {
-    return res.status(404).json({ message: 'Profile not found.' });
-  }
-
-  await db.studentProfiles.findByIdAndUpdate(profile.id, {
-    resumeText: version.beforeVersion?.resumeText || profile.resumeText
-  });
-
-  res.json({ message: 'Restored previous resume version.', version });
-});
-
-router.get('/placement/readiness', authMiddleware, checkRole(['student']), async (req, res) => {
-  const context = await buildProfileContext(req.user.id);
-
-  const readiness = context.readiness;
-  const metrics = {
-    atsScore: context.profile?.atsScore || 0,
-    resumeQuality: context.profile?.industryReadinessScore || 0,
-    githubScore: context.github?.strengthScore || 0,
-    assessmentScore: Math.round(context.assessmentAverage || 0),
-    certifications: (context.profile?.certifications || []).length,
-    projects: (context.profile?.projects || []).length,
-    applicationSuccessRate: context.acceptanceRate || 0
   };
 
-  const strengths = [
-    metrics.atsScore >= 70 ? 'Resume ATS strength' : 'ATS strength needs keyword optimization',
-    metrics.githubScore >= 50 ? 'GitHub activity is visible' : 'GitHub contribution volume needs to improve',
-    metrics.assessmentScore >= 70 ? 'Assessment performance is strong' : 'Assessment performance can improve with more practice'
-  ].filter(Boolean);
+  const actionableMetrics = {
+    atsScore: getScoreDetails(
+      metrics.atsScore, 100, 
+      'Resume lacks role-specific keywords and proper formatting.', 'ATS matching is strong.', 
+      ['Include keywords from target jobs', 'Use standard section headings'], ['Maintain current quality', 'Update with new skills'], 
+      '+15 readiness points', 'Steady'
+    ),
+    resumeQuality: getScoreDetails(
+      metrics.resumeQuality, 100, 
+      'Project descriptions and impact statements are weak.', 'Experience and projects are well-documented.', 
+      ['Rewrite bullets with the STAR method', 'Add numeric metrics'], ['Keep metrics updated'], 
+      '+10 readiness points', 'Steady'
+    ),
+    githubScore: getScoreDetails(
+      metrics.githubScore, 100, 
+      'Low repository count or missing public activity.', 'Consistent public contributions.', 
+      ['Push code regularly', 'Add detailed README files'], ['Start an open source contribution'], 
+      '+15 readiness points', 'Steady'
+    ),
+    assessmentScore: getScoreDetails(
+      metrics.assessmentScore, 100, 
+      'Low scores on technical skill evaluations.', 'Demonstrates strong technical competence.', 
+      ['Take more skill tests', 'Review weak areas'], ['Take advanced level tests'], 
+      '+10 readiness points', 'Steady'
+    )
+  };
 
-  const weakAreas = [
-    metrics.resumeQuality < 70 ? 'Resume quality requires stronger project and skill evidence' : null,
-    metrics.certifications < 2 ? 'Add a relevant certification' : null,
-    metrics.projects < 2 ? 'Create at least two project showcases' : null
-  ].filter(Boolean);
-
-  const recommendations = [
-    'Refine resume keywords using the target role description.',
-    'Build one public project with measurable impact and README details.',
-    'Use the skill assessment results to practice the weakest area.'
-  ];
+  const strengths = [];
+  const weakAreas = [];
+  const recommendations = [];
 
   const snapshot = await db.placementReadinessSnapshots.create({
     userId: req.user.id,
@@ -491,9 +275,7 @@ router.get('/placement/readiness', authMiddleware, checkRole(['student']), async
     score: readiness,
     label: readiness >= 80 ? 'Placement Ready' : readiness >= 60 ? 'On Track' : 'Needs Focus',
     metrics,
-    strengths,
-    weakAreas,
-    recommendations,
+    actionableMetrics,
     snapshot: snapshot || null
   });
 });
@@ -505,46 +287,84 @@ router.get('/assessments', authMiddleware, checkRole(['student']), async (req, r
 
 router.post('/assessments/generate', authMiddleware, checkRole(['student']), async (req, res) => {
   const skill = String(req.body.skill || 'Software Development').trim();
-  const questions = [
-    { id: 'q1', prompt: `Explain what ${skill} means in one practical sentence and why it matters in hiring.` },
-    { id: 'q2', prompt: `List two common tools, libraries, or frameworks used with ${skill}.` },
-    { id: 'q3', prompt: `Describe one real-world project scenario where ${skill} would be useful.` },
-    { id: 'q4', prompt: `What are two metrics or outcomes you would highlight when presenting ${skill} in an interview?` },
-    { id: 'q5', prompt: `What is one gap you still want to improve in ${skill} after your current projects?` }
-  ];
+  try {
+    const prompt = [
+      `Generate exactly 5 multiple-choice questions to assess a software engineer's knowledge in ${skill}.`,
+      'Return ONLY a valid JSON object matching exactly this schema. Do NOT include markdown code blocks. Just raw JSON:',
+      '{',
+      '  "questions": [',
+      '    {',
+      '      "id": "q1",',
+      '      "prompt": "The question text?",',
+      '      "options": ["A", "B", "C", "D"],',
+      '      "answerIndex": 0',
+      '    }',
+      '  ]',
+      '}'
+    ].join('\n');
 
-  res.json({ skill, questions });
+    const raw = await callGemini(prompt);
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : null;
+
+    if (!parsed || !parsed.questions) throw new Error('Failed to parse AI response.');
+
+    res.json({ skill, questions: parsed.questions });
+  } catch (error) {
+    logStability(`Assessment generate failed: ${error.message}`);
+    res.status(500).json({ message: 'Failed to generate assessment. Please try again.' });
+  }
 });
 
 router.post('/assessments/submit', authMiddleware, checkRole(['student']), async (req, res) => {
-  const { skill = 'Skill Assessment', answers = [] } = req.body;
-  const total = Math.max(1, answers.length);
+  const { skill = 'Skill Assessment', answers = [], questions = [] } = req.body;
+  
+  if (!questions.length || !answers.length) {
+    return res.status(400).json({ message: 'Missing questions or answers.' });
+  }
 
-  const score = clamp(
-    answers.reduce((sum, answer) => {
-      const text = String(answer.answer || '');
-      const words = text.trim().split(/\s+/).filter(Boolean).length;
-      const keywordBoost = text.toLowerCase().includes(String(skill).toLowerCase()) ? 8 : 0;
-      return sum + clamp(6 + words * 2 + keywordBoost, 0, 20);
-    }, 0) / total,
-    0,
-    100
-  );
-
-  const strengths = score >= 70 ? ['You clearly understand the core concepts and can explain them in practical terms.'] : ['Focus on adding more concrete examples and measurable outcomes to your answers.'];
-  const weaknesses = score < 70 ? ['Provide stronger examples from projects or internships.'] : [];
-
-  const record = await db.skillAssessments.create({
-    userId: req.user.id,
-    skill,
-    score: Math.round(score),
-    strengths,
-    weaknesses,
-    completedAt: new Date().toISOString(),
-    answers
+  let correctCount = 0;
+  questions.forEach(q => {
+    const studentAnswer = answers.find(a => a.id === q.id || a.question === q.prompt);
+    if (studentAnswer && studentAnswer.answer === q.options[q.answerIndex]) {
+      correctCount++;
+    }
   });
 
-  res.status(201).json(record);
+  const rawScore = (correctCount / questions.length) * 10;
+
+  try {
+    const prompt = [
+      `A student just completed a ${skill} assessment and scored ${rawScore}/10.`,
+      'Return ONLY a valid JSON object matching exactly this schema. Do NOT include markdown code blocks. Just raw JSON:',
+      '{',
+      '  "strengthAreas": ["string"],',
+      '  "weakAreas": ["string"],',
+      '  "learningRecommendations": ["string"],',
+      '  "difficultyRating": "Beginner OR Intermediate OR Advanced",',
+      '  "careerImpact": "string"',
+      '}'
+    ].join('\n');
+
+    const raw = await callGemini(prompt);
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
+
+    const record = await db.skillAssessments.create({
+      userId: req.user.id,
+      skill,
+      score: Math.round((rawScore / 10) * 100),
+      strengths: parsed.strengthAreas || [],
+      weaknesses: parsed.weakAreas || [],
+      completedAt: new Date().toISOString(),
+      details: parsed
+    });
+
+    res.status(201).json(record);
+  } catch (error) {
+    logStability(`Assessment submit failed: ${error.message}`);
+    res.status(500).json({ message: 'Failed to score assessment.' });
+  }
 });
 
 module.exports = router;

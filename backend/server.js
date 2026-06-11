@@ -19,12 +19,10 @@ const advancedRoutes = require('./routes/advanced');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const allowedOrigins = new Set(
-  (process.env.CORS_ORIGIN || process.env.FRONTEND_URL || 'http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173,http://127.0.0.1:3000')
-    .split(',')
-    .map((origin) => origin.trim())
-    .filter(Boolean)
-);
+const corsOptions = {
+  origin: 'https://career-genie-beige.vercel.app',
+  credentials: true
+};
 
 process.on('uncaughtException', (error) => {
   console.error('Uncaught Exception:', error);
@@ -35,29 +33,29 @@ process.on('unhandledRejection', (reason) => {
 });
 
 // Middleware
-app.use(cors({
-  origin(origin, callback) {
-    if (!origin || allowedOrigins.has(origin)) {
-      return callback(null, true);
-    }
-    return callback(new Error(`CORS blocked for origin: ${origin}`));
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  exposedHeaders: ['Content-Length', 'Content-Type']
-}));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
+// Request logging middleware
 app.use((req, res, next) => {
+  console.log(req.method, req.originalUrl);
   const startedAt = Date.now();
   res.on('finish', () => {
     const duration = Date.now() - startedAt;
-    console.log(`${req.method} ${req.originalUrl} ${res.statusCode} ${duration}ms`);
+    console.log(`[FINISH] ${req.method} ${req.originalUrl} ${res.statusCode} ${duration}ms`);
   });
   next();
 });
+
+app.use(cors({
+  origin: 'https://career-genie-beige.vercel.app',
+  credentials: true
+}));
+app.options('*', cors({
+  origin: 'https://career-genie-beige.vercel.app',
+  credentials: true
+}));
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
