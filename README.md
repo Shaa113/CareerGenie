@@ -82,12 +82,11 @@ Deployed reliably on **Vercel (Frontend)** and **Render (Backend).**
 
 ---
 
-## Database & AI Services
+## Database 
 
 - **MongoDB** - Primary Database
 - **Mongoose** - Database ODM
-- **Groq API** - LLM Integration
-- **Llama Models** - AI Career Assistant
+
 
 ---
 
